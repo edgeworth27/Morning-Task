@@ -28,7 +28,6 @@ In [repository Actions variables](https://github.com/edgeworth27/Morning-Task/se
 | --- | --- |
 | `AI_MODEL` | Optional; default `gpt-4.1-mini`, must support structured JSON output |
 | `TOPIC_PAGES` | Optional; default `2`, range `1`–`20` |
-| `BRIEFING_ENABLED` | Set to `true` **after successful live validation** to enable daily scheduled delivery |
 
 The workflow supplies its own short-lived `GITHUB_TOKEN`; no personal GitHub token is needed in Actions. It needs `contents: write` to maintain delivery state in the `briefing-state` branch. Organization policy must allow that permission. Keep this repository private if you want stored briefings and analysis to remain private. The private chat ID is not saved in the state branch (a hash is saved); briefing text and Telegram message IDs are stored there. Never put credentials in repository variables.
 
@@ -47,7 +46,7 @@ The cloud editor and GitHub Actions are separate runtimes. Adding a secret in cl
 1. Run `python -m unittest discover -s tests -v`. These tests use **synthetic fixtures**. They verify DST, pagination, citation integrity, quote handling, error paths and duplicate-send recovery; they do not establish live API access or Telegram delivery.
 2. Open **Actions → Daily X intelligence → Run workflow** with `dry_run` enabled. The `date` input is the **briefing date in Eastern time**, not the date of the previous-day source posts. Leave it blank after today's 6:15 AM cutoff, or choose a recent past briefing date. This makes real, billable X and AI requests but sends no Telegram messages. Inspect `briefing.json`, `.txt`, and `.html` in that run's artifact.
 3. Run again with `dry_run` disabled. Confirm that Telegram accepted the messages and inspect the actual briefing in your bot’s private chat. API acceptance does not prove that a phone notification was displayed; ensure the chat is unmuted and Telegram notifications are enabled on your device.
-4. Set `BRIEFING_ENABLED=true`. Check that a scheduled run executes and that the Telegram briefing arrives. Enable GitHub's failed-workflow notifications for this repository; API outages, credit exhaustion, or rate limits cause a visible failed run, never a fake briefing. A failed day requires a manual rerun, using its briefing date, while still inside X recent-search retention.
+4. Daily scheduling is enabled in the deployed workflow after live delivery validation. To pause it, use **Actions → Daily X intelligence → ⋯ → Disable workflow**; re-enable it from the same page. No enablement repository variable is needed. Check that a scheduled run executes and that the Telegram briefing arrives. Enable GitHub's failed-workflow notifications for this repository; API outages, credit exhaustion, or rate limits cause a visible failed run, never a fake briefing. A failed day requires a manual rerun, using its briefing date, while still inside X recent-search retention.
 
 The script rejects incomplete/future windows and dates beyond recent search's seven-day retention. It will never manufacture five entries when fewer eligible posts exist.
 
