@@ -163,7 +163,7 @@ class AnalysisTests(unittest.TestCase):
 class EndToEndHTTP:
     """Fake transport runs production collect/analyze/render/deliver code, no live posts."""
     def __init__(self):
-        self.emails = []
+        self.messages = []
         self.x_calls = 0
 
     def request(self, method, url, **kw):
@@ -178,9 +178,9 @@ class EndToEndHTTP:
             overnight = "EVERY" in kw["body"]["messages"][0]["content"]
             items = [analysis(p) for p in (posts if overnight else posts[:5])]
             return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"items": items})}}]}
-        if url == "https://api.resend.com/emails":
-            self.emails.append(kw)
-            return {"id": "SYNTHETIC-MESSAGE-ID"}
+        if url.startswith("https://api.telegram.org/") and url.endswith("/sendMessage"):
+            self.messages.append(kw)
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
         raise AssertionError("Unexpected API destination")
 
 
@@ -202,8 +202,8 @@ class MemoryState:
 
 
 class PipelineTests(unittest.TestCase):
-    ENV = {"X_BEARER_TOKEN": "synthetic", "AI_API_KEY": "synthetic", "RESEND_API_KEY": "synthetic",
-           "EMAIL_TO": "recipient@example.invalid", "EMAIL_FROM": "sender@example.invalid", "DELIVERY": "email"}
+    ENV = {"X_BEARER_TOKEN": "synthetic", "AI_API_KEY": "synthetic",
+           "TELEGRAM_BOT_TOKEN": "123:synthetic", "TELEGRAM_CHAT_ID": "456"}
 
     def run_pipeline(self, http, state, dry=False, now=None):
         with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, self.ENV, clear=True):
@@ -218,38 +218,39 @@ class PipelineTests(unittest.TestCase):
         result = self.run_pipeline(http, state)
         self.assertEqual(result["status"], "sent")
         self.assertEqual(http.x_calls, 7)
-        self.assertEqual(len(http.emails), 1)
-        text = http.emails[0]["body"]["text"]
+        self.assertEqual(len(http.messages), 1)
+        text = http.messages[0]["body"]["text"]
         self.assertIn("@AndreasSteno", text)
         self.assertIn("https://x.com/AndreasSteno/status/101", text)
         self.assertIn("2026-10-14 10:00:00 PM EDT", text)
         self.run_pipeline(http, state)
-        self.assertEqual(len(http.emails), 1)
+        self.assertEqual(len(http.messages), 1)
         self.assertEqual(http.x_calls, 7)
 
-    def test_resume_after_send_state_failure_uses_same_payload_and_key(self):
+    def test_resume_after_final_state_failure_does_not_resend(self):
         http, state = EndToEndHTTP(), MemoryState(fail_final=True)
         with self.assertRaisesRegex(b.BriefingError, "STATE WRITE"):
             self.run_pipeline(http, state)
         self.assertEqual(state.record["status"], "prepared")
         self.run_pipeline(http, state)
         self.assertEqual(http.x_calls, 7)
-        self.assertEqual(http.emails[0], http.emails[1])
+        self.assertEqual(len(http.messages), 1)
 
-    def test_old_ambiguous_email_delivery_requires_review(self):
+    def test_ambiguous_telegram_delivery_requires_review(self):
         http, state = EndToEndHTTP(), MemoryState(fail_final=True)
         with self.assertRaises(b.BriefingError):
             self.run_pipeline(http, state)
-        with self.assertRaisesRegex(b.BriefingError, "idempotency window"):
-            self.run_pipeline(http, state, now=b.parsed("2026-10-16T12:01:00Z"))
-        self.assertEqual(len(http.emails), 1)
+        state.record["status"] = "sending"
+        with self.assertRaisesRegex(b.BriefingError, "uncertain"):
+            self.run_pipeline(http, state)
+        self.assertEqual(len(http.messages), 1)
 
     def test_dry_run_has_no_delivery_or_state_writes(self):
         http, state = EndToEndHTTP(), MemoryState()
         result = self.run_pipeline(http, state, dry=True)
         self.assertEqual(len(result["top_five"]), 5)
         self.assertEqual(state.saves, 0)
-        self.assertEqual(http.emails, [])
+        self.assertEqual(http.messages, [])
 
     def test_failed_retrieval_does_not_send(self):
         state = MemoryState()
@@ -310,7 +311,7 @@ class PipelineTests(unittest.TestCase):
         state.record["recipient_fingerprint"] = "different-recipient"
         with self.assertRaisesRegex(b.BriefingError, "changed"):
             self.run_pipeline(http, state)
-        self.assertEqual(len(http.emails), 1)
+        self.assertEqual(len(http.messages), 1)
 
 
 class DeliveryTests(unittest.TestCase):
@@ -331,9 +332,40 @@ class DeliveryTests(unittest.TestCase):
                 b.HTTP().request("POST", exc.url, token="synthetic", body={})
             self.assertEqual(request.call_count, 1)
 
-    def test_email_missing_id_fails(self):
+    def test_telegram_missing_id_fails_and_blocks_retry(self):
+        state = MemoryState()
+        record = {"day": "2026-10-15", "status": "prepared", "parts": ["synthetic"], "message_ids": []}
         with self.assertRaisesRegex(b.BriefingError, "message ID"):
-            b.deliver(QueueHTTP([{}]), "test", "a", "b", "key", {"subject": "test"})
+            b.deliver_telegram(QueueHTTP([{"ok": True, "result": {}}]), "123:synthetic", "456", record, state)
+        self.assertEqual(state.record["status"], "sending")
+        with self.assertRaisesRegex(b.BriefingError, "uncertain"):
+            b.deliver_telegram(QueueHTTP([]), "123:synthetic", "456", state.record, state)
+
+    def test_parts_fit_telegram_limit_even_with_emoji(self):
+        text = "SYNTHETIC "+ "😀" * 5000
+        parts = b.telegram_parts(text)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(p.encode("utf-16-le")) // 2 < 4096 for p in parts))
+        self.assertEqual("".join(p.split("\n\n", 1)[1] for p in parts), text)
+
+    def test_chat_discovery_requires_private_start(self):
+        http = QueueHTTP([{"ok": True, "result": [{"message": {"text": "/start", "chat": {"id": 456, "type": "private"}}}]}])
+        self.assertEqual(b.telegram_chat(http, "123:synthetic"), "456")
+        with self.assertRaises(b.BriefingError):
+            b.telegram_chat(QueueHTTP([{"ok": True, "result": []}]), "123:synthetic")
+
+    def test_message_split_preserves_direct_post_link(self):
+        url = "https://x.com/AndreasSteno/status/1234567890123456789"
+        parts = b.telegram_parts("x" * 3470 + "\n" + url + "\n" + "y" * 100)
+        self.assertTrue(any(url in part for part in parts))
+
+    def test_telegram_http_failure_does_not_log_bot_token(self):
+        url = "https://api.telegram.org/bot123:synthetic/sendMessage"
+        exc = urllib.error.HTTPError(url, 401, "test", {}, None)
+        with patch("urllib.request.urlopen", side_effect=exc):
+            with self.assertRaises(b.BriefingError) as caught:
+                b.HTTP().request("POST", url, token=None, body={})
+            self.assertNotIn("synthetic", str(caught.exception))
 
 
 if __name__ == "__main__":

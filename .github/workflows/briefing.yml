@@ -7,6 +7,10 @@ on:
     - cron: '15 11 * * *'
   workflow_dispatch:
     inputs:
+      find_chat_id:
+        description: 'Setup only: find Telegram chat ID after sending /start to your bot'
+        type: boolean
+        default: false
       date:
         description: 'Eastern briefing date YYYY-MM-DD (blank = today)'
         type: string
@@ -32,9 +36,8 @@ jobs:
       AI_API_KEY: ${{ secrets.AI_API_KEY }}
       AI_MODEL: ${{ vars.AI_MODEL || 'gpt-4.1-mini' }}
       TOPIC_PAGES: ${{ vars.TOPIC_PAGES || '2' }}
-      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-      EMAIL_TO: ${{ vars.EMAIL_TO }}
-      EMAIL_FROM: ${{ vars.EMAIL_FROM }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -51,7 +54,12 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           EVENT_NAME: ${{ github.event_name }}
           CRON: ${{ github.event.schedule }}
+          FIND_CHAT_ID: ${{ inputs.find_chat_id }}
         run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$FIND_CHAT_ID" == true ]]; then
+            python briefing.py --telegram-chat
+            exit 0
+          fi
           args=()
           if [[ "$EVENT_NAME" == schedule ]]; then
             read -r minute hour rest <<< "$CRON"

@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import date, datetime, time as dtime, timedelta, timezone
-from email.utils import parseaddr
 import hashlib
 import html
 import json
@@ -74,8 +73,9 @@ def scheduled_day(now, slot):
 class HTTP:
     def request(self, method, url, *, token, body=None, headers=None):
         data = None if body is None else json.dumps(body).encode()
-        hdr = {"Authorization": f"Bearer {token}", "Accept": "application/json",
-               "User-Agent": "Morning-Task/1.0"}
+        hdr = {"Accept": "application/json", "User-Agent": "Morning-Task/1.0"}
+        if token:
+            hdr["Authorization"] = f"Bearer {token}"
         if data is not None:
             hdr["Content-Type"] = "application/json"
         hdr.update(headers or {})
@@ -95,7 +95,8 @@ class HTTP:
                         raise BriefingError(f"{urllib.parse.urlsplit(url).hostname}: rate limited; retry later") from None
                     time.sleep(max(1, delay))
                     continue
-                raise BriefingError(f"{urllib.parse.urlsplit(url).hostname}: HTTP {exc.code} for {method} {urllib.parse.urlsplit(url).path}") from None
+                # Telegram embeds its credential in the URL path: never log paths.
+                raise BriefingError(f"{urllib.parse.urlsplit(url).hostname}: HTTP {exc.code} for {method} request") from None
             except urllib.error.URLError:
                 raise BriefingError(f"{urllib.parse.urlsplit(url).hostname}: network/TLS request failed") from None
         raise BriefingError("HTTP retries exhausted")
@@ -381,12 +382,70 @@ class GitHubState:
         self.sha = result["content"]["sha"]
 
 
-def deliver(http, token, sender, recipient, key, email):
-    result = http.request("POST", "https://api.resend.com/emails", token=token,
-                          headers={"Idempotency-Key": key}, body={"from": sender, "to": [recipient], **email})
-    if not isinstance(result.get("id"), str) or not result["id"]:
-        raise BriefingError("Email service did not return a message ID")
-    return result["id"]
+def telegram_call(http, token, method, body):
+    if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
+        raise BriefingError("Invalid TELEGRAM_BOT_TOKEN format")
+    result = http.request("POST", f"https://api.telegram.org/bot{token}/{method}", token=None, body=body)
+    if result.get("ok") is not True or "result" not in result:
+        raise BriefingError("Telegram rejected the request; check bot/chat configuration")
+    return result["result"]
+
+
+def telegram_chat(http, token):
+    updates = telegram_call(http, token, "getUpdates", {"allowed_updates": ["message"], "limit": 100})
+    chats = {str(u["message"]["chat"]["id"]) for u in updates if
+             u.get("message", {}).get("chat", {}).get("type") == "private"
+             and u["message"].get("text", "").split(" ")[0] == "/start"}
+    if len(chats) != 1:
+        raise BriefingError("Send /start to your bot in a private chat, then retry. Exactly one private /start chat must be present.")
+    chat = chats.pop()
+    print(f"Set repository Actions secret TELEGRAM_CHAT_ID to: {chat}")
+    return chat
+
+
+def telegram_parts(text):
+    # Telegram caps message length; count UTF-16 units conservatively, including emoji.
+    parts, current, units = [], [], 0
+    for char in text:
+        size = len(char.encode("utf-16-le")) // 2
+        if units + size > 3500:
+            buffered = "".join(current)
+            cut = buffered.rfind("\n") + 1
+            if cut == 0:
+                cut = len(buffered)
+            parts.append(buffered[:cut])
+            current = list(buffered[cut:])
+            units = len(buffered[cut:].encode("utf-16-le")) // 2
+        current.append(char)
+        units += size
+    if current:
+        parts.append("".join(current))
+    return [f"Daily X briefing ({i}/{len(parts)})\n\n{part}" for i, part in enumerate(parts, 1)]
+
+
+def deliver_telegram(http, token, chat, record, state):
+    if record["status"] == "sending":
+        raise BriefingError("Telegram delivery outcome is uncertain; check your chat and reconcile the sending record before retrying")
+    for index in range(len(record["message_ids"]), len(record["parts"])):
+        if index:
+            time.sleep(1.1)  # Respect Telegram's per-chat message cadence.
+        # Telegram has no idempotency keys. Persist uncertainty BEFORE each send;
+        # never automatically resend a part after a crash or ambiguous network failure.
+        record = {**record, "status": "sending", "sending_part": index}
+        state.save(record)
+        response = telegram_call(http, token, "sendMessage", {
+            "chat_id": chat, "text": record["parts"][index],
+            "link_preview_options": {"is_disabled": True}, "protect_content": True,
+        })
+        if not isinstance(response.get("message_id"), int):
+            raise BriefingError("Telegram did not return a message ID")
+        record = {**record, "status": "prepared", "sending_part": None,
+                  "message_ids": record["message_ids"] + [response["message_id"]]}
+        state.save(record)
+    record = {**record, "status": "sent", "accepted_at": iso(datetime.now(UTC))}
+    state.save(record)
+    print(f"Telegram accepted all {len(record['parts'])} briefing message(s) for {record['day']}; device notification/read receipt is not verified.")
+    return record
 
 
 def execute(*, day, now, dry_run, output, http=None, state=None):
@@ -395,26 +454,24 @@ def execute(*, day, now, dry_run, output, http=None, state=None):
     if now.astimezone(UTC) - windows(day)["previous_day"][0].astimezone(UTC) > timedelta(days=7):
         raise BriefingError("Requested day is outside X recent search retention; use an archive API implementation")
     http = http or HTTP()
-    recipient = sender = email_token = None
+    chat = telegram_token = None
     record = None
     fingerprint = None
     if not dry_run:
-        recipient, sender, email_token = require("EMAIL_TO"), require("EMAIL_FROM"), require("RESEND_API_KEY")
-        for name, value in (("EMAIL_TO", recipient), ("EMAIL_FROM", sender)):
-            _, address = parseaddr(value)
-            if not address or "@" not in address or any(c in value for c in "\r\n,;"):
-                raise BriefingError(f"{name} must contain one email address")
-        fingerprint = hashlib.sha256((sender + "\n" + recipient).encode()).hexdigest()
+        chat, telegram_token = require("TELEGRAM_CHAT_ID"), require("TELEGRAM_BOT_TOKEN")
+        if not re.fullmatch(r"[0-9]+", chat):
+            raise BriefingError("TELEGRAM_CHAT_ID must be a positive private-chat ID")
+        fingerprint = hashlib.sha256(("telegram\n" + chat).encode()).hexdigest()
         if state is None:
             state = GitHubState(http, require("GITHUB_TOKEN"), require("GITHUB_REPOSITORY"), require("GITHUB_SHA"))
         record = state.load(day)
         if record and record["recipient_fingerprint"] != fingerprint:
-            raise BriefingError("Sender/recipient changed for an existing daily delivery; manual review required")
+            raise BriefingError("Delivery destination changed for an existing daily briefing; manual review required")
         if record and record["status"] == "sent":
             print(f"Already submitted for {day}; no duplicate sent.")
             return record
-        if record and now - parsed(record["prepared_at"]) > timedelta(hours=23):
-            raise BriefingError("Unresolved delivery is older than the provider idempotency window; reconcile its ID in Resend before retrying")
+        if record and record["status"] == "sending":
+            raise BriefingError("Telegram delivery outcome is uncertain; check your chat and reconcile the sending record before retrying")
     if record is None:
         x = XClient(http, require("X_BEARER_TOKEN"))
         ai = AI(http, require("AI_API_KEY"), os.getenv("AI_MODEL", "gpt-4.1-mini"))
@@ -428,27 +485,30 @@ def execute(*, day, now, dry_run, output, http=None, state=None):
         (output / "briefing.txt").write_text(email["text"])
         (output / "briefing.html").write_text(email["html"])
         if dry_run:
-            print(f"Retrieval and analysis completed; dry run saved to {output}. No email sent.")
+            print(f"Retrieval and analysis completed; dry run saved to {output}. No Telegram messages sent.")
             return report
         record = {"day": day.isoformat(), "status": "prepared", "prepared_at": iso(now),
-                  "recipient_fingerprint": fingerprint, "email": email,
-                  "idempotency_key": f"daily-x/{day}/{fingerprint[:16]}"}
-        # Persist EXACT payload before delivery. A retry must not regenerate a different AI email.
+                  "recipient_fingerprint": fingerprint, "parts": telegram_parts(email["text"]), "message_ids": []}
+        # Persist the exact payload before delivery; never regenerate it on a retry.
         state.save(record)
-    message_id = deliver(http, email_token, sender, recipient, record["idempotency_key"], record["email"])
-    record = {**record, "status": "sent", "provider_id": message_id, "accepted_at": iso(datetime.now(UTC))}
-    state.save(record)
-    print(f"Resend accepted briefing for {day}; message ID: {message_id}. Inbox delivery is not yet verified.")
-    return record
+    return deliver_telegram(http, telegram_token, chat, record, state)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--date", type=date.fromisoformat, help="Briefing date in Eastern time (not source-post date)")
     parser.add_argument("--schedule-slot", type=int, choices=(10, 11), help="UTC cron hour; only correct DST slot runs")
-    parser.add_argument("--dry-run", action="store_true", help="Real X + AI calls, writes files; no email or persistent state")
+    parser.add_argument("--dry-run", action="store_true", help="Real X + AI calls, writes files; no messages or persistent state")
+    parser.add_argument("--telegram-chat", action="store_true", help="Find the private /start chat ID for your configured bot; no messages sent")
     parser.add_argument("--output", type=Path, default=Path("out"))
     args = parser.parse_args(argv)
+    if args.telegram_chat:
+        try:
+            telegram_chat(HTTP(), require("TELEGRAM_BOT_TOKEN"))
+        except (BriefingError, KeyError, TypeError, ValueError) as exc:
+            print(f"Telegram setup failed: {exc}", file=sys.stderr)
+            return 1
+        return 0
     now = datetime.now(UTC)
     day = args.date or now.astimezone(ET).date()
     if args.schedule_slot is not None:
