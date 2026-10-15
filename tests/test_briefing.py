@@ -181,6 +181,14 @@ class AnalysisTests(unittest.TestCase):
         result = self.analyze([analysis(post())])
         self.assertEqual(result[0]["url"], post()["url"])
 
+    def test_schema_constrains_ids_to_actual_retrieved_posts(self):
+        response = {"choices": [{"finish_reason": "stop", "message": {
+            "content": json.dumps({"items": [analysis(post())]})}}]}
+        http = QueueHTTP([response])
+        b.AI(http, "synthetic", "synthetic").analyze([post()], "overnight")
+        schema = http.calls[0][2]["body"]["response_format"]["json_schema"]["schema"]
+        self.assertEqual(schema["properties"]["items"]["items"]["properties"]["id"]["enum"], ["101"])
+
     def test_diverse_topic_pool_deduplicates(self):
         result = b.candidate_pool({"macro": [post()], "rates": [post()]})
         self.assertEqual(len(result), 1)

@@ -240,6 +240,10 @@ class AI:
         for item in inputs:
             item["text"] = item["text"][:12000]
             item["context"] = [{**c, "text": c["text"][:4000]} for c in item["context"]]
+        # Constrain decoding, rather than asking the model to reproduce arbitrary
+        # 19-digit IDs or accidentally cite an ID from quoted context.
+        item_schema = {**ITEM_SCHEMA, "properties": {
+            **ITEM_SCHEMA["properties"], "id": {"type": "string", "enum": [p["id"] for p in posts]}}}
         result = self.http.request("POST", "https://api.openai.com/v1/chat/completions", token=self.token, body={
             "model": self.model,
             "messages": [{"role": "system", "content": instruction},
@@ -247,7 +251,7 @@ class AI:
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "briefing", "strict": True,
                 "schema": {"type": "object", "additionalProperties": False,
-                           "properties": {"items": {"type": "array", "items": ITEM_SCHEMA}}, "required": ["items"]},
+                           "properties": {"items": {"type": "array", "items": item_schema}}, "required": ["items"]},
             }},
         })
         try:
