@@ -152,6 +152,16 @@ class AnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(b.BriefingError, "omitted"):
             self.analyze([])
 
+    def test_missing_batch_items_recovered_without_omitting_any_posts(self):
+        posts = [post("101"), post("102")]
+        replies = [{"choices": [{"finish_reason": "stop", "message": {
+            "content": json.dumps({"items": [analysis(p)]})}}]} for p in posts]
+        http = QueueHTTP(replies)
+        result = b.AI(http, "synthetic", "synthetic").analyze(posts, "overnight")
+        self.assertEqual([p["id"] for p in result], ["101", "102"])
+        second_input = json.loads(http.calls[1][2]["body"]["messages"][1]["content"])
+        self.assertEqual([p["id"] for p in second_input], ["102"])
+
     def test_duplicate_post_rejected(self):
         with self.assertRaisesRegex(b.BriefingError, "duplicated"):
             self.analyze([analysis(post()), analysis(post())])
@@ -372,7 +382,8 @@ class DeliveryTests(unittest.TestCase):
 
     def test_chat_discovery_requires_private_start(self):
         http = QueueHTTP([{"ok": True, "result": [{"message": {"text": "/start", "chat": {"id": 456, "type": "private"}}}]}])
-        self.assertEqual(b.telegram_chat(http, "123:synthetic"), "456")
+        with patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(b.telegram_chat(http, "123:synthetic"), "456")
         with self.assertRaises(b.BriefingError):
             b.telegram_chat(QueueHTTP([{"ok": True, "result": []}]), "123:synthetic")
 

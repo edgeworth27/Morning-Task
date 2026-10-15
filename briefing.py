@@ -274,12 +274,22 @@ class AI:
             ids.append(item["id"])
         if len(ids) != len(set(ids)):
             raise BriefingError("AI duplicated a post")
-        if mode == "overnight" and set(ids) != allowed:
-            raise BriefingError("AI omitted overnight posts")
         if mode != "overnight" and len(ids) != min(5, len(posts)):
             raise BriefingError("AI did not return the required number of ranked posts")
         by_id = {p["id"]: p for p in posts}
-        return [{**by_id[item["id"]], "analysis": item} for item in items]
+        analyzed = {item["id"]: {**by_id[item["id"]], "analysis": item} for item in items}
+        if mode == "overnight" and set(ids) != allowed:
+            missing = [p for p in posts if p["id"] not in analyzed]
+            if len(missing) == len(posts):
+                if len(posts) == 1:
+                    raise BriefingError("AI omitted overnight posts")
+                # Strictly smaller batches ensure bounded recovery, never an unchanged retry.
+                halfway = len(missing) // 2
+                recovered = self.analyze(missing[:halfway], mode) + self.analyze(missing[halfway:], mode)
+            else:
+                recovered = self.analyze(missing, mode)
+            analyzed.update({p["id"]: p for p in recovered})
+        return [analyzed[p["id"]] for p in posts] if mode == "overnight" else [analyzed[item["id"]] for item in items]
 
 
 def collect(x, ai, day, topic_pages):
