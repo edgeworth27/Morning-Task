@@ -252,7 +252,7 @@ class PipelineTests(unittest.TestCase):
         http, state = EndToEndHTTP(), MemoryState()
         result = self.run_pipeline(http, state)
         self.assertEqual(result["status"], "sent")
-        self.assertEqual(http.x_calls, 7)
+        self.assertEqual(http.x_calls, 9)
         self.assertEqual(len(http.messages), 1)
         text = http.messages[0]["body"]["text"]
         self.assertIn("@AndreasSteno", text)
@@ -260,7 +260,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("Oct 14 10:00 PM EDT", text)
         self.run_pipeline(http, state)
         self.assertEqual(len(http.messages), 1)
-        self.assertEqual(http.x_calls, 7)
+        self.assertEqual(http.x_calls, 9)
 
     def test_resume_after_final_state_failure_does_not_resend(self):
         http, state = EndToEndHTTP(), MemoryState(fail_final=True)
@@ -268,7 +268,7 @@ class PipelineTests(unittest.TestCase):
             self.run_pipeline(http, state)
         self.assertEqual(state.record["status"], "prepared")
         self.run_pipeline(http, state)
-        self.assertEqual(http.x_calls, 7)
+        self.assertEqual(http.x_calls, 9)
         self.assertEqual(len(http.messages), 1)
 
     def test_ambiguous_telegram_delivery_requires_review(self):
@@ -394,6 +394,15 @@ class PipelineTests(unittest.TestCase):
 
         report = b.collect(X(), AI(), date(2026, 10, 15), 2)
         self.assertEqual([p["id"] for p in report["top_five"]], ["102"])
+
+    def test_material_tesla_and_spacex_are_eligible_for_elon_coverage(self):
+        for topic in ("Tesla", "SpaceX"):
+            with self.subTest(topic=topic):
+                p = post("101", "elonmusk")
+                p["analysis"] = {**analysis(p), "topic": topic, "relevant": True}
+                self.assertTrue(b.relevant_elon(p))
+                p["analysis"]["relevant"] = False
+                self.assertFalse(b.relevant_elon(p))
 
     def test_spaced_digest_puts_top_five_first_and_uses_safe_telegram_links(self):
         http = EndToEndHTTP()

@@ -28,6 +28,8 @@ QUERIES = {
     "AI": '("artificial intelligence" OR OpenAI OR Anthropic OR "AI model" OR "machine learning") -is:retweet lang:en',
     "health": '("clinical trial" OR FDA OR biotech OR medicine OR "public health" OR longevity) -is:retweet lang:en',
     "electronic music": '("electronic music" OR techno OR "house music" OR "drum and bass" OR synthesizer) -is:retweet lang:en',
+    "Tesla": '(Tesla OR TSLA) -is:retweet lang:en',
+    "SpaceX": '(SpaceX OR Starlink OR Starship) -is:retweet lang:en',
 }
 
 
@@ -226,9 +228,13 @@ class AI:
             "sentence, at most 22 words; implication is at most 12 words, conditional when needed. Preserve attribution "
             "and uncertainty over detail. Avoid medical/investment advice. "
             "Classify relevant=true ONLY for a direct, substantive connection to crypto, interest rates, macroeconomics, "
-            "artificial intelligence, health, or electronic music. Otherwise relevant=false and topic=other. "
-            "For Elon Musk, exclude jokes, memes, personal remarks, partisan commentary, and routine Tesla/SpaceX "
-            "updates unless the post itself makes a clear material connection to one of those six interests. "
+            "artificial intelligence, health, electronic music, or material Tesla/SpaceX business developments. "
+            "The reader is a shareholder in Tesla and SpaceX. Include material production/delivery results, earnings, "
+            "margins, financing/valuation, major contracts, regulatory/legal risks, safety incidents, product milestones, "
+            "Starlink business developments and consequential launch/Starship milestones or failures. Explain their "
+            "conditional business/shareholder implications, without assuming a public ticker or inventing prices. "
+            "Routine launches, promotional posts, photos and hype alone are not material. Otherwise relevant=false "
+            "and topic=other. For Elon Musk, exclude jokes, memes, personal remarks and unrelated partisan commentary. "
             "Do not stretch 'macro' to include all politics or 'AI' to include all technology. "
             "A substantive quote adds analysis, news, explanation or a meaningful opinion beyond an emoji, agreement "
             "or a link. A quote's own text must add substance, not merely its quoted source. "
@@ -239,9 +245,9 @@ class AI:
             instruction += (
                 "Rank and return the FIVE most consequential distinct posts from these candidates (or all if fewer). "
                 "Judge material new information, primary evidence, breadth of impact and credibility over popularity. "
-                "Cover crypto, rates, macro, AI, health and electronic music where warranted; five slots cannot guarantee "
-                "all six topics. Avoid redundant coverage of the same event and unsupported hype. Omit insubstantial quotes "
-                "and any Elon Musk post that is not directly relevant to the six interests."
+                "Cover crypto, rates, macro, AI, health, electronic music and material Tesla/SpaceX developments where "
+                "warranted; five slots cannot guarantee every topic. Avoid redundant coverage of the same event and "
+                "unsupported hype. Omit insubstantial quotes and Elon Musk posts unrelated to these interests."
             )
         # Keep a single long note from exhausting the model context; source text stays intact in JSON evidence.
         inputs = [{k: p[k] for k in ("id", "author", "created_at", "kinds", "metrics", "text", "context")} for p in posts]
