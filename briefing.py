@@ -404,10 +404,14 @@ def telegram_chat(http, token):
     chats = {str(u["message"]["chat"]["id"]) for u in updates if
              u.get("message", {}).get("chat", {}).get("type") == "private"
              and u["message"].get("text", "").split(" ")[0] == "/start"}
+    if not chats:
+        raise BriefingError("No private /start message found. Open your new bot (not BotFather), send /start, then retry.")
     if len(chats) != 1:
-        raise BriefingError("Send /start to your bot in a private chat, then retry. Exactly one private /start chat must be present.")
+        raise BriefingError("Multiple private /start chats found. Use a dedicated bot or configure your own TELEGRAM_CHAT_ID explicitly; refusing to guess.")
     chat = chats.pop()
     print(f"Set repository Actions secret TELEGRAM_CHAT_ID to: {chat}")
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        print(f"::notice::Set repository Actions secret TELEGRAM_CHAT_ID to: {chat}")
     return chat
 
 
