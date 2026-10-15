@@ -2,6 +2,7 @@
 import base64
 from datetime import date, datetime, timedelta
 import json
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -315,6 +316,11 @@ class PipelineTests(unittest.TestCase):
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_workflow_diagnostic_escapes_annotation_controls(self):
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), patch("sys.stdout", new_callable=io.StringIO) as stdout, patch("sys.stderr", new_callable=io.StringIO):
+            b.report_error("test%\nsecond line")
+        self.assertEqual(stdout.getvalue(), "::error::test%25%0Asecond line\n")
+
     def test_prepared_state_written_as_versioned_content(self):
         http = QueueHTTP([b.BriefingError("api.github.com: HTTP 404 for GET /missing"),
                           b.BriefingError("api.github.com: HTTP 404 for GET /missing"), {}, {"content": {"sha": "new"}}])

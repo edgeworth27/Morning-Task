@@ -35,6 +35,14 @@ class BriefingError(Exception):
     pass
 
 
+def report_error(message):
+    print(message, file=sys.stderr)
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        # Surface safe diagnostics through the Checks API as well as downloadable logs.
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error::{escaped}")
+
+
 def require(name):
     value = os.getenv(name, "").strip()
     if not value:
@@ -506,7 +514,7 @@ def main(argv=None):
         try:
             telegram_chat(HTTP(), require("TELEGRAM_BOT_TOKEN"))
         except (BriefingError, KeyError, TypeError, ValueError) as exc:
-            print(f"Telegram setup failed: {exc}", file=sys.stderr)
+            report_error(f"Telegram setup failed: {exc}")
             return 1
         return 0
     now = datetime.now(UTC)
@@ -520,7 +528,7 @@ def main(argv=None):
         execute(day=day, now=now, dry_run=args.dry_run, output=args.output)
     except (BriefingError, ValueError, KeyError, TypeError) as exc:
         # Unexpected programming errors keep traceback; expected failures never log API bodies.
-        print(f"Briefing failed: {exc}", file=sys.stderr)
+        report_error(f"Briefing failed: {exc}")
         return 1
     return 0
 
