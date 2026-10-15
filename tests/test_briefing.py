@@ -1,0 +1,340 @@
+"""Synthetic fixtures ONLY. These do not establish live X or notification access."""
+import base64
+from datetime import date, datetime, timedelta
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+import urllib.error
+import urllib.parse
+
+import briefing as b
+
+
+def post(i="101", author="AndreasSteno", kinds=None):
+    return {"id": i, "author": author, "text": "SYNTHETIC TEST INPUT; not a real X post.",
+            "created_at": "2026-10-15T02:00:00Z", "kinds": kinds or [],
+            "url": f"https://x.com/{author}/status/{i}", "metrics": {"like_count": 10}, "context": []}
+
+
+def analysis(p, substantive=True):
+    return {"id": p["id"], "summary": "Synthetic test summary.", "implication": "Synthetic conditional implication.",
+            "substantive": substantive, "topic": "macro"}
+
+
+class ClockTests(unittest.TestCase):
+    def test_summer_windows(self):
+        w = b.windows(date(2026, 7, 2))
+        self.assertEqual(b.iso(w["overnight"][0]), "2026-07-02T01:00:00Z")
+        self.assertEqual(b.iso(w["overnight"][1]), "2026-07-02T10:15:00Z")
+        self.assertEqual(b.iso(w["previous_day"][0]), "2026-07-01T04:00:00Z")
+
+    def test_winter_windows(self):
+        w = b.windows(date(2026, 1, 2))
+        self.assertEqual(b.iso(w["overnight"][0]), "2026-01-02T02:00:00Z")
+        self.assertEqual(b.iso(w["overnight"][1]), "2026-01-02T11:15:00Z")
+
+    def test_dst_days_are_not_fixed_24_hours(self):
+        for day, hours in [(date(2026, 3, 9), 23), (date(2026, 11, 2), 25)]:
+            a, z = b.windows(day)["previous_day"]
+            self.assertEqual((z.astimezone(b.UTC) - a.astimezone(b.UTC)).total_seconds(), hours * 3600)
+
+    def test_overnight_crosses_spring_and_fall_switch(self):
+        for day, hours in [(date(2026, 3, 8), 8.25), (date(2026, 11, 1), 10.25)]:
+            a, z = b.windows(day)["overnight"]
+            self.assertEqual((z.astimezone(b.UTC) - a.astimezone(b.UTC)).total_seconds(), hours * 3600)
+
+    def test_correct_dst_slot_even_with_delay(self):
+        now = b.parsed("2026-07-02T12:30:00Z")
+        self.assertEqual(b.scheduled_day(now, 10), date(2026, 7, 2))
+        self.assertIsNone(b.scheduled_day(now, 11))
+        self.assertIsNone(b.scheduled_day(b.parsed("2026-01-02T10:15:00Z"), 10))
+        self.assertEqual(b.scheduled_day(b.parsed("2026-01-02T11:20:00Z"), 11), date(2026, 1, 2))
+
+    def test_before_cutoff_skips(self):
+        self.assertIsNone(b.scheduled_day(b.parsed("2026-07-02T10:14:59Z"), 10))
+
+
+class QueueHTTP:
+    def __init__(self, responses):
+        self.responses, self.calls = list(responses), []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        r = self.responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+def xpage(ids, token=None, timestamp="2026-10-15T02:00:00Z", kinds=None):
+    tweets = [{"id": i, "author_id": "42", "text": "SYNTHETIC API FIXTURE", "created_at": timestamp,
+               "referenced_tweets": [{"id": "999", "type": k} for k in (kinds or [])]} for i in ids]
+    return {"data": tweets, "includes": {"users": [{"id": "42", "username": "AndreasSteno"}]},
+            "meta": {"next_token": token} if token else {}}
+
+
+class RetrievalTests(unittest.TestCase):
+    def search(self, http, **kwargs):
+        return b.XClient(http, "test").search("from:AndreasSteno -is:retweet", *b.windows(date(2026, 10, 15))["overnight"], **kwargs)
+
+    def test_all_pages_and_dedup(self):
+        http = QueueHTTP([xpage(["101"], "next"), xpage(["101", "102"])])
+        posts, stats = self.search(http)
+        self.assertEqual([p["id"] for p in posts], ["101", "102"])
+        self.assertTrue(stats["complete"])
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(http.calls[1][1]).query)
+        self.assertEqual(query["next_token"], ["next"])
+        self.assertNotIn("exclude", query)
+
+    def test_replies_included(self):
+        posts, _ = self.search(QueueHTTP([xpage(["101"], kinds=["replied_to"])]))
+        self.assertIn("replied_to", posts[0]["kinds"])
+
+    def test_budget_marks_partial(self):
+        posts, stats = self.search(QueueHTTP([xpage(["101"], "next")]), max_pages=1)
+        self.assertFalse(stats["complete"])
+
+    def test_partial_errors_fail_closed(self):
+        with self.assertRaisesRegex(b.BriefingError, "partial errors"):
+            self.search(QueueHTTP([{"errors": [{"detail": "test"}]}]))
+
+    def test_window_end_exclusive(self):
+        with self.assertRaisesRegex(b.BriefingError, "outside"):
+            self.search(QueueHTTP([xpage(["101"], timestamp="2026-10-15T10:15:00Z")]))
+
+    def test_repeated_token_fails(self):
+        with self.assertRaisesRegex(b.BriefingError, "repeated"):
+            self.search(QueueHTTP([xpage(["101"], "same"), xpage(["102"], "same")]))
+
+    def test_note_tweet_preferred(self):
+        page = xpage(["101"])
+        page["data"][0]["note_tweet"] = {"text": "SYNTHETIC FULL LONG POST"}
+        posts, _ = self.search(QueueHTTP([page]))
+        self.assertEqual(posts[0]["text"], "SYNTHETIC FULL LONG POST")
+
+    def test_missing_author_fails(self):
+        page = xpage(["101"])
+        page["includes"] = {}
+        with self.assertRaisesRegex(b.BriefingError, "author"):
+            self.search(QueueHTTP([page]))
+
+
+class AnalysisTests(unittest.TestCase):
+    def analyze(self, items, mode="overnight", posts=None):
+        response = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"items": items})}}]}
+        return b.AI(QueueHTTP([response]), "test", "test-model").analyze(posts or [post()], mode)
+
+    def test_unknown_id_rejected(self):
+        with self.assertRaisesRegex(b.BriefingError, "unknown"):
+            self.analyze([analysis(post("999"))])
+
+    def test_omitted_post_rejected(self):
+        with self.assertRaisesRegex(b.BriefingError, "omitted"):
+            self.analyze([])
+
+    def test_duplicate_post_rejected(self):
+        with self.assertRaisesRegex(b.BriefingError, "duplicated"):
+            self.analyze([analysis(post()), analysis(post())])
+
+    def test_invented_url_rejected(self):
+        item = analysis(post())
+        item["summary"] = "See https://x.com/fake/status/999"
+        with self.assertRaisesRegex(b.BriefingError, "URL"):
+            self.analyze([item])
+
+    def test_exact_five_required(self):
+        posts = [post(str(i)) for i in range(6)]
+        with self.assertRaisesRegex(b.BriefingError, "required number"):
+            self.analyze([analysis(p) for p in posts[:4]], "rank", posts)
+
+    def test_source_link_comes_from_retrieval(self):
+        result = self.analyze([analysis(post())])
+        self.assertEqual(result[0]["url"], post()["url"])
+
+    def test_diverse_topic_pool_deduplicates(self):
+        result = b.candidate_pool({"macro": [post()], "rates": [post()]})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["topics"], ["macro", "rates"])
+
+
+class EndToEndHTTP:
+    """Fake transport runs production collect/analyze/render/deliver code, no live posts."""
+    def __init__(self):
+        self.emails = []
+        self.x_calls = 0
+
+    def request(self, method, url, **kw):
+        if url.startswith("https://api.x.com/"):
+            self.x_calls += 1
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            overnight = "from:" in query["query"][0]
+            stamp = "2026-10-15T02:00:00Z" if overnight else "2026-10-14T15:00:00Z"
+            return xpage([str(101 if overnight else 200 + self.x_calls)], timestamp=stamp)
+        if url.startswith("https://api.openai.com/"):
+            posts = json.loads(kw["body"]["messages"][1]["content"])
+            overnight = "EVERY" in kw["body"]["messages"][0]["content"]
+            items = [analysis(p) for p in (posts if overnight else posts[:5])]
+            return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"items": items})}}]}
+        if url == "https://api.resend.com/emails":
+            self.emails.append(kw)
+            return {"id": "SYNTHETIC-MESSAGE-ID"}
+        raise AssertionError("Unexpected API destination")
+
+
+class MemoryState:
+    def __init__(self, fail_final=False):
+        self.record = None
+        self.saves = 0
+        self.fail_final = fail_final
+
+    def load(self, day):
+        return self.record
+
+    def save(self, record):
+        self.saves += 1
+        if record["status"] == "sent" and self.fail_final:
+            self.fail_final = False
+            raise b.BriefingError("SYNTHETIC STATE WRITE FAILURE")
+        self.record = json.loads(json.dumps(record))
+
+
+class PipelineTests(unittest.TestCase):
+    ENV = {"X_BEARER_TOKEN": "synthetic", "AI_API_KEY": "synthetic", "RESEND_API_KEY": "synthetic",
+           "EMAIL_TO": "recipient@example.invalid", "EMAIL_FROM": "sender@example.invalid", "DELIVERY": "email"}
+
+    def run_pipeline(self, http, state, dry=False, now=None):
+        with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, self.ENV, clear=True):
+            result = b.execute(day=date(2026, 10, 15), now=now or b.parsed("2026-10-15T12:00:00Z"),
+                               dry_run=dry, output=Path(out), http=http, state=state)
+            if dry:
+                self.assertTrue((Path(out) / "briefing.json").exists())
+            return result
+
+    def test_full_mocked_retrieval_to_delivery_and_rerun(self):
+        http, state = EndToEndHTTP(), MemoryState()
+        result = self.run_pipeline(http, state)
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(http.x_calls, 7)
+        self.assertEqual(len(http.emails), 1)
+        text = http.emails[0]["body"]["text"]
+        self.assertIn("@AndreasSteno", text)
+        self.assertIn("https://x.com/AndreasSteno/status/101", text)
+        self.assertIn("2026-10-14 10:00:00 PM EDT", text)
+        self.run_pipeline(http, state)
+        self.assertEqual(len(http.emails), 1)
+        self.assertEqual(http.x_calls, 7)
+
+    def test_resume_after_send_state_failure_uses_same_payload_and_key(self):
+        http, state = EndToEndHTTP(), MemoryState(fail_final=True)
+        with self.assertRaisesRegex(b.BriefingError, "STATE WRITE"):
+            self.run_pipeline(http, state)
+        self.assertEqual(state.record["status"], "prepared")
+        self.run_pipeline(http, state)
+        self.assertEqual(http.x_calls, 7)
+        self.assertEqual(http.emails[0], http.emails[1])
+
+    def test_old_ambiguous_email_delivery_requires_review(self):
+        http, state = EndToEndHTTP(), MemoryState(fail_final=True)
+        with self.assertRaises(b.BriefingError):
+            self.run_pipeline(http, state)
+        with self.assertRaisesRegex(b.BriefingError, "idempotency window"):
+            self.run_pipeline(http, state, now=b.parsed("2026-10-16T12:01:00Z"))
+        self.assertEqual(len(http.emails), 1)
+
+    def test_dry_run_has_no_delivery_or_state_writes(self):
+        http, state = EndToEndHTTP(), MemoryState()
+        result = self.run_pipeline(http, state, dry=True)
+        self.assertEqual(len(result["top_five"]), 5)
+        self.assertEqual(state.saves, 0)
+        self.assertEqual(http.emails, [])
+
+    def test_failed_retrieval_does_not_send(self):
+        state = MemoryState()
+        with self.assertRaisesRegex(b.BriefingError, "unavailable"):
+            self.run_pipeline(QueueHTTP([b.BriefingError("X unavailable")]), state)
+        self.assertEqual(state.saves, 0)
+
+    def test_future_window_rejected(self):
+        with self.assertRaisesRegex(b.BriefingError, "not closed"):
+            self.run_pipeline(EndToEndHTTP(), MemoryState(), now=b.parsed("2026-10-15T10:14:00Z"))
+
+    def test_old_date_rejected(self):
+        with self.assertRaisesRegex(b.BriefingError, "retention"):
+            self.run_pipeline(EndToEndHTTP(), MemoryState(), now=b.parsed("2026-10-23T12:00:00Z"))
+
+    def test_substantive_quotes_only_but_all_replies_retained(self):
+        posts = [post("101"), post("102", kinds=["quoted"]), post("103", kinds=["quoted"]),
+                 post("104", kinds=["replied_to", "quoted"])]
+
+        class X:
+            def search(self, query, *args, **kwargs):
+                return (posts if "from:" in query else []), {"pages": 1, "posts": 4, "complete": True}
+
+        class AI:
+            model = "synthetic"
+
+            def analyze(self, batch, mode):
+                return [{**p, "analysis": analysis(p, substantive=p["id"] == "103")} for p in batch]
+
+        report = b.collect(X(), AI(), date(2026, 10, 15), 2)
+        self.assertEqual([p["id"] for p in report["overnight"]], ["101", "103", "104"])
+        self.assertEqual(report["omitted_quotes"], 1)
+        self.assertEqual(len(report["overnight_raw"]), 4)
+
+    def test_empty_day_reports_no_posts_without_inventing_five(self):
+        class X:
+            def search(self, *args, **kwargs):
+                return [], {"pages": 1, "posts": 0, "complete": True}
+
+        ai = b.AI(QueueHTTP([]), "synthetic", "synthetic")
+        report = b.collect(X(), ai, date(2026, 10, 15), 2)
+        rendered = b.render(report)
+        self.assertIn("Only 0 eligible candidates", rendered["text"])
+        self.assertEqual(report["top_five"], [])
+
+    def test_html_escapes_ai_text_and_links_real_source(self):
+        http = EndToEndHTTP()
+        with patch.dict(os.environ, self.ENV, clear=True):
+            report = b.collect(b.XClient(http, "synthetic"), b.AI(http, "synthetic", "synthetic"), date(2026, 10, 15), 2)
+        report["overnight"][0]["analysis"]["summary"] = "<script>alert('test')</script>"
+        email = b.render(report)
+        self.assertNotIn("<script>", email["html"])
+        self.assertIn('<a href="https://x.com/AndreasSteno/status/101">', email["html"])
+
+    def test_changed_recipient_stops_duplicate_or_misdirected_delivery(self):
+        http, state = EndToEndHTTP(), MemoryState()
+        self.run_pipeline(http, state)
+        state.record["recipient_fingerprint"] = "different-recipient"
+        with self.assertRaisesRegex(b.BriefingError, "changed"):
+            self.run_pipeline(http, state)
+        self.assertEqual(len(http.emails), 1)
+
+
+class DeliveryTests(unittest.TestCase):
+    def test_prepared_state_written_as_versioned_content(self):
+        http = QueueHTTP([b.BriefingError("api.github.com: HTTP 404 for GET /missing"),
+                          b.BriefingError("api.github.com: HTTP 404 for GET /missing"), {}, {"content": {"sha": "new"}}])
+        state = b.GitHubState(http, "test", "owner/repo", "commit-sha")
+        self.assertIsNone(state.load(date(2026, 10, 15)))
+        state.save({"day": "2026-10-15", "status": "prepared"})
+        payload = http.calls[-1][2]["body"]
+        self.assertEqual(json.loads(base64.b64decode(payload["content"]))["status"], "prepared")
+        self.assertEqual(state.sha, "new")
+
+    def test_unsafe_post_not_automatically_retried(self):
+        exc = urllib.error.HTTPError("https://api.github.com/repos/o/r/issues", 503, "test", {}, None)
+        with patch("urllib.request.urlopen", side_effect=exc) as request:
+            with self.assertRaises(b.BriefingError):
+                b.HTTP().request("POST", exc.url, token="synthetic", body={})
+            self.assertEqual(request.call_count, 1)
+
+    def test_email_missing_id_fails(self):
+        with self.assertRaisesRegex(b.BriefingError, "message ID"):
+            b.deliver(QueueHTTP([{}]), "test", "a", "b", "key", {"subject": "test"})
+
+
+if __name__ == "__main__":
+    unittest.main()
