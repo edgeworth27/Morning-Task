@@ -22,7 +22,7 @@ def post(i="101", author="AndreasSteno", kinds=None):
 
 def analysis(p, substantive=True):
     return {"id": p["id"], "summary": "Synthetic test summary.", "implication": "Synthetic conditional implication.",
-            "substantive": substantive, "topic": "macro"}
+            "substantive": substantive, "relevant": True, "topic": "macro"}
 
 
 class ClockTests(unittest.TestCase):
@@ -257,7 +257,7 @@ class PipelineTests(unittest.TestCase):
         text = http.messages[0]["body"]["text"]
         self.assertIn("@AndreasSteno", text)
         self.assertIn("https://x.com/AndreasSteno/status/101", text)
-        self.assertIn("2026-10-14 10:00:00 PM EDT", text)
+        self.assertIn("Oct 14 10:00 PM EDT", text)
         self.run_pipeline(http, state)
         self.assertEqual(len(http.messages), 1)
         self.assertEqual(http.x_calls, 7)
@@ -347,6 +347,67 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(b.BriefingError, "changed"):
             self.run_pipeline(http, state)
         self.assertEqual(len(http.messages), 1)
+
+    def test_elon_filter_excludes_off_topic_posts_and_replies_only_for_elon(self):
+        posts = [post("101", "elonmusk"), post("102", "elonmusk", ["replied_to"]),
+                 post("103", "elonmusk"), post("104", "AndreasSteno")]
+
+        class X:
+            def search(self, query, *args, **kwargs):
+                return (posts if "from:" in query else []), {"pages": 1, "posts": 4, "complete": True}
+
+        class AI:
+            model = "synthetic"
+
+            def analyze(self, batch, mode):
+                result = []
+                for p in batch:
+                    a = analysis(p)
+                    if p["id"] in ("101", "102", "104"):
+                        a.update(relevant=False, topic="other")
+                    result.append({**p, "analysis": a})
+                return result
+
+        report = b.collect(X(), AI(), date(2026, 10, 15), 2)
+        self.assertEqual([p["id"] for p in report["overnight"]], ["103", "104"])
+        self.assertEqual(report["omitted_elon_off_topic"], 2)
+        self.assertEqual(len(report["overnight_raw"]), 4)
+
+    def test_off_topic_elon_rank_selection_is_replaced(self):
+        posts = [post("101", "elonmusk"), post("102")]
+
+        class X:
+            def search(self, query, *args, **kwargs):
+                return ([] if "from:" in query else posts), {"pages": 1, "posts": 2, "complete": True}
+
+        class AI:
+            model = "synthetic"
+
+            def analyze(self, batch, mode):
+                result = []
+                for p in batch:
+                    a = analysis(p)
+                    if p["author"] == "elonmusk":
+                        a.update(relevant=False, topic="other")
+                    result.append({**p, "analysis": a})
+                return result
+
+        report = b.collect(X(), AI(), date(2026, 10, 15), 2)
+        self.assertEqual([p["id"] for p in report["top_five"]], ["102"])
+
+    def test_spaced_digest_puts_top_five_first_and_uses_safe_telegram_links(self):
+        http = EndToEndHTTP()
+        with patch.dict(os.environ, self.ENV, clear=True):
+            report = b.collect(b.XClient(http, "synthetic"), b.AI(http, "synthetic", "synthetic"), date(2026, 10, 15), 2)
+        email = b.render(report)
+        self.assertLess(email["text"].index("⭐ TOP FIVE"), email["text"].index("🌙 OVERNIGHT"))
+        self.assertIn("\n\nWhy:", email["text"])
+        self.assertNotIn("RETRIEVAL COVERAGE", email["text"])
+        rendered = b.telegram_html(email["text"] + "\n<script>bad</script>")
+        self.assertIn("<b>⭐ TOP FIVE", rendered)
+        self.assertIn('>View post ↗</a>', rendered)
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("&lt;script&gt;", rendered)
 
 
 class DeliveryTests(unittest.TestCase):
