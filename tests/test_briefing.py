@@ -102,6 +102,22 @@ class RetrievalTests(unittest.TestCase):
         with self.assertRaisesRegex(b.BriefingError, "partial errors"):
             self.search(QueueHTTP([{"errors": [{"detail": "test"}]}]))
 
+    def test_unavailable_reference_is_labeled_without_discarding_real_reply(self):
+        page = xpage(["101"], kinds=["replied_to"])
+        page["errors"] = [{"resource_type": "tweet", "resource_id": "999",
+                           "type": "https://api.x.com/2/problems/resource-not-found"}]
+        posts, stats = self.search(QueueHTTP([page]))
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(stats["unavailable_context"], 1)
+        self.assertIn("unavailable", posts[0]["context"][0]["text"])
+
+    def test_missing_primary_post_is_not_treated_as_missing_context(self):
+        page = xpage(["101"], kinds=["replied_to"])
+        page["errors"] = [{"resource_type": "tweet", "resource_id": "101",
+                           "type": "https://api.x.com/2/problems/resource-not-found"}]
+        with self.assertRaisesRegex(b.BriefingError, "partial errors"):
+            self.search(QueueHTTP([page]))
+
     def test_window_end_exclusive(self):
         with self.assertRaisesRegex(b.BriefingError, "outside"):
             self.search(QueueHTTP([xpage(["101"], timestamp="2026-10-15T10:15:00Z")]))

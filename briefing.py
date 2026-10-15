@@ -123,10 +123,21 @@ class XClient:
             "user.fields": "username,name",
         }
         posts, seen_tokens, pages = {}, set(), 0
+        unavailable = set()
         while True:
             result = self.http.request("GET", "https://api.x.com/2/tweets/search/recent?" + urllib.parse.urlencode(params), token=self.token)
-            if result.get("errors"):
-                raise BriefingError("X returned partial errors; refusing to label retrieval complete")
+            primary_ids = {t["id"] for t in result.get("data", [])}
+            context_ids = {r["id"] for t in result.get("data", []) + result.get("includes", {}).get("tweets", [])
+                           for r in t.get("referenced_tweets", [])}
+            for error in result.get("errors", []):
+                resource = str(error.get("resource_id", ""))
+                problem = str(error.get("type", "")).rsplit("/", 1)[-1]
+                if (error.get("resource_type") == "tweet" and resource in context_ids - primary_ids
+                        and problem in ("resource-not-found", "not-authorized-for-resource")):
+                    unavailable.add(resource)
+                else:
+                    safe_problem = re.sub(r"[^A-Za-z0-9_-]", "", problem)[:80] or "unspecified"
+                    raise BriefingError(f"X returned partial errors ({safe_problem}); refusing to label retrieval complete")
             users = {u["id"]: u for u in result.get("includes", {}).get("users", [])}
             references = {t["id"]: t for t in result.get("includes", {}).get("tweets", [])}
             for tweet in result.get("data", []):
@@ -146,6 +157,10 @@ class XClient:
                     if original:
                         context.append({"id": original["id"], "kind": ref["type"],
                                         "text": original.get("note_tweet", {}).get("text", original["text"])})
+                    else:
+                        unavailable.add(ref["id"])
+                        context.append({"id": ref["id"], "kind": ref["type"],
+                                        "text": "[Referenced post unavailable through X API. Do not infer its content.]"})
                 posts[tweet["id"]] = {
                     "id": tweet["id"], "author": author,
                     "text": tweet.get("note_tweet", {}).get("text", tweet["text"]),
@@ -156,9 +171,9 @@ class XClient:
             pages += 1
             next_token = result.get("meta", {}).get("next_token")
             if not next_token:
-                return list(posts.values()), {"pages": pages, "posts": len(posts), "complete": True}
+                return list(posts.values()), {"pages": pages, "posts": len(posts), "complete": True, "unavailable_context": len(unavailable)}
             if max_pages is not None and pages >= max_pages:
-                return list(posts.values()), {"pages": pages, "posts": len(posts), "complete": False}
+                return list(posts.values()), {"pages": pages, "posts": len(posts), "complete": False, "unavailable_context": len(unavailable)}
             if next_token in seen_tokens:
                 raise BriefingError("X repeated a pagination token")
             seen_tokens.add(next_token)
@@ -307,6 +322,7 @@ def render(report):
              f"OVERNIGHT WATCH — {(day-timedelta(days=1)):%B %d} 9 PM to {day:%B %d} 6:15 AM Eastern",
              f"All available original posts and replies; substantive quotes only. Plain reposts excluded.",
              f"Retrieved {len(report['overnight_raw'])} posts; omitted {report['omitted_quotes']} insubstantial quote(s)."]
+    lines.append(f"Unavailable referenced posts: {report['overnight_coverage'].get('unavailable_context', 0)}; their contents are not inferred.")
 
     def append_post(post, number):
         kind = "reply" if "replied_to" in post["kinds"] else "quote" if "quoted" in post["kinds"] else "post"
@@ -333,7 +349,8 @@ def render(report):
     lines.extend(["", "RETRIEVAL COVERAGE"])
     for topic, stats in report["topic_coverage"].items():
         lines.append(f"{topic}: {stats['posts']} posts, {stats['pages']} page(s), " +
-                     ("query exhausted" if stats["complete"] else "page budget reached; partial search"))
+                     ("query exhausted" if stats["complete"] else "page budget reached; partial search") +
+                     f"; {stats.get('unavailable_context', 0)} unavailable references")
     lines.extend([f"{report['candidate_count']} distinct candidates submitted for ranking.",
                   f"AI model: {report['model']}. Generated: {display_time(report['generated_at'])}.",
                   "Deleted, private, withheld, or unindexed posts may be unavailable through X.",
